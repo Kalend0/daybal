@@ -279,6 +279,11 @@ function App() {
         setCallbackMessage(`Error: ${data.detail}`)
         setTimeout(() => setAppState('connect'), 2000)
       } else {
+        // Store account_uid in localStorage for subsequent requests
+        if (data.account_uids && data.account_uids.length > 0) {
+          localStorage.setItem('daybal_account_uid', data.account_uids[0])
+          console.log('Stored account_uid:', data.account_uids[0])
+        }
         console.log('Bank connected, fetching balance...')
         setCallbackMessage('Bank connected! Loading balance...')
         // Fetch balance data
@@ -327,8 +332,14 @@ function App() {
 
   const fetchBalanceData = async () => {
     try {
-      console.log('Fetching comparison data...')
-      const res = await fetch(`${API_BASE}/comparison-data`)
+      const accountUid = localStorage.getItem('daybal_account_uid')
+      console.log('Fetching comparison data with account_uid:', accountUid)
+
+      const url = accountUid
+        ? `${API_BASE}/comparison-data?account_uid=${accountUid}`
+        : `${API_BASE}/comparison-data`
+
+      const res = await fetch(url)
       console.log('Comparison data status:', res.status)
       const data = await res.json()
       console.log('Comparison data:', data)

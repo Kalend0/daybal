@@ -233,14 +233,25 @@ async def handle_callback(code: str = None, state: str = None, error: str = None
                 }
 
             data = response.json()
-            session_store["session_id"] = data.get("session_id")
-            session_store["accounts"] = data.get("accounts", [])
+            session_id = data.get("session_id")
+            accounts = data.get("accounts", [])
+
+            # Extract account UIDs properly
+            account_uids = []
+            for acc in accounts:
+                uid = acc.get("uid")
+                if uid:
+                    account_uids.append(uid)
+
+            session_store["session_id"] = session_id
+            session_store["account_uids"] = account_uids
             session_store["bank_connected"] = True
 
             return {
                 "success": True,
-                "session_id": data.get("session_id"),
-                "accounts": data.get("accounts", [])
+                "session_id": session_id,
+                "account_uids": account_uids,
+                "raw_accounts": accounts  # For debugging
             }
 
     except Exception as e:
@@ -266,20 +277,19 @@ async def get_accounts():
 
 
 @app.get("/api/balance")
-async def get_balance():
+async def get_balance(account_uid: str = None):
     """Fetch the current balance for the first linked account."""
-    if not session_store.get("bank_connected"):
-        return {"error": True, "detail": "Bank not connected"}
-
-    accounts = session_store.get("accounts", [])
-    if not accounts:
-        return {"error": True, "detail": "No accounts found"}
-
-    # Use the first account
-    account_id = accounts[0].get("account_id") or accounts[0].get("uid")
+    # Allow account_uid to be passed as query param (for serverless)
+    if account_uid:
+        account_id = account_uid
+    else:
+        account_uids = session_store.get("account_uids", [])
+        if not account_uids:
+            return {"error": True, "detail": "No accounts found. Pass account_uid parameter."}
+        account_id = account_uids[0]
 
     if not account_id:
-        return {"error": True, "detail": "No account ID found", "accounts": accounts}
+        return {"error": True, "detail": "No account ID found"}
 
     try:
         async with httpx.AsyncClient() as client:
@@ -353,13 +363,13 @@ async def get_balance_by_id(account_id: str):
 
 
 @app.get("/api/comparison-data")
-async def get_comparison_data():
+async def get_comparison_data(account_uid: str = None):
     """
     Get comparison data: current balance vs historical medians/averages.
     For now, returns mock historical data. Will be replaced with database queries.
     """
     # Get current balance first
-    balance_response = await get_balance()
+    balance_response = await get_balance(account_uid=account_uid)
 
     if balance_response.get("error"):
         return balance_response
