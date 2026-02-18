@@ -235,6 +235,8 @@ function App() {
   const [callbackMessage, setCallbackMessage] = useState('')
 
   useEffect(() => {
+    console.log('App mounted, checking initial state...')
+    console.log('Current URL:', window.location.href)
     checkInitialState()
   }, [])
 
@@ -243,38 +245,48 @@ function App() {
     const code = params.get('code')
     const error = params.get('error')
 
+    console.log('URL params - code:', code ? 'present' : 'none', 'error:', error)
+
     if (code) {
       // Handle OAuth callback
+      console.log('Processing OAuth callback...')
       setAppState('callback')
       setCallbackMessage('Processing bank authorization...')
       await handleCallback(code)
     } else if (error) {
+      console.log('OAuth error:', error)
       setAppState('connect')
       setPinError(`Bank auth error: ${error}`)
     } else {
-      // Check if already authenticated
+      console.log('No code, showing PIN screen')
       setAppState('pin')
     }
   }
 
   const handleCallback = async (code) => {
     try {
+      console.log('Calling /api/callback...')
       const res = await fetch(`${API_BASE}/callback?code=${code}`)
+      console.log('Response status:', res.status)
       const data = await res.json()
+      console.log('Response data:', data)
 
       // Clear URL params
       window.history.replaceState({}, '', '/')
 
       if (data.error) {
+        console.log('Callback error:', data.detail)
         setCallbackMessage(`Error: ${data.detail}`)
         setTimeout(() => setAppState('connect'), 2000)
       } else {
+        console.log('Bank connected, fetching balance...')
         setCallbackMessage('Bank connected! Loading balance...')
         // Fetch balance data
         await fetchBalanceData()
         setAppState('dashboard')
       }
     } catch (err) {
+      console.error('Callback exception:', err)
       setCallbackMessage(`Error: ${err.message}`)
       setTimeout(() => setAppState('connect'), 2000)
     }
