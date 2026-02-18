@@ -86,3 +86,34 @@ AIS Only: The application must only use Account Information Service permissions.
 Database Privacy: Store only the date and the amount. Do not store IBANs, names, or bank account IDs.
 
 Rate Limiting: The backend must limit PIN attempts to prevent brute-force attacks.
+
+**Chapter 4: Implementation Status & Technical Notes**
+
+4.1 Completed
+- PIN gatekeeper with mobile-friendly numeric keypad
+- Rate limiting: 5 failed attempts triggers 5-minute lockout
+- Enable Banking OAuth flow with ABN AMRO (production)
+- Real-time balance fetching and display
+- Mobile-first responsive design with PWA meta tags
+- Vercel deployment with Python serverless functions + React frontend
+
+4.2 Serverless Architecture Considerations
+Vercel serverless functions do not share memory between requests. To handle this:
+- The `account_uid` from Enable Banking is stored in browser localStorage after successful bank auth
+- Subsequent API calls pass `account_uid` as a query parameter
+- This allows balance fetches to work across different serverless instances
+
+4.3 Enable Banking Session Validity
+- Sessions are configured with 90-day validity (`valid_until` parameter)
+- After 90 days, user must re-authenticate with ABN AMRO
+- PIN is still required on every app use (security gatekeeper)
+
+4.4 Next Steps (Database Integration)
+1. Set up Vercel Postgres (add DATABASE_URL to environment variables)
+2. Create tables:
+   - `sessions`: store session_id, account_uid, expiry_date
+   - `daily_balances`: store date, balance_amount (no PII)
+3. On app load: check for valid session in DB, skip bank auth if valid
+4. Implement daily cron job to record balance snapshots
+5. Calculate 12-month median and 24-month average from stored data
+6. Optional: backfill historical balances from transaction history
