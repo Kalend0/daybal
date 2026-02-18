@@ -327,14 +327,24 @@ function App() {
 
   const fetchBalanceData = async () => {
     try {
+      console.log('Fetching comparison data...')
       const res = await fetch(`${API_BASE}/comparison-data`)
+      console.log('Comparison data status:', res.status)
       const data = await res.json()
+      console.log('Comparison data:', data)
 
       if (!data.error) {
         setBalanceData(data)
+        return true
+      } else {
+        console.error('Balance API error:', data.detail)
+        setBalanceData({ error: true, detail: data.detail })
+        return false
       }
     } catch (err) {
       console.error('Failed to fetch balance:', err)
+      setBalanceData({ error: true, detail: err.message })
+      return false
     }
   }
 
@@ -386,10 +396,29 @@ function App() {
     )
   }
 
-  if (appState === 'dashboard' && balanceData) {
+  if (appState === 'dashboard') {
+    if (balanceData?.error) {
+      return (
+        <div style={styles.container}>
+          <h1 style={styles.title}>DayBal</h1>
+          <p style={styles.error}>Failed to load balance: {balanceData.detail}</p>
+          <button onClick={handleRefresh} style={styles.refreshButton}>
+            Retry
+          </button>
+        </div>
+      )
+    }
+    if (balanceData) {
+      return (
+        <div style={styles.container}>
+          <BalanceDisplay data={balanceData} onRefresh={handleRefresh} />
+        </div>
+      )
+    }
     return (
       <div style={styles.container}>
-        <BalanceDisplay data={balanceData} onRefresh={handleRefresh} />
+        <h1 style={styles.title}>DayBal</h1>
+        <p style={styles.loadingText}>Loading balance...</p>
       </div>
     )
   }
