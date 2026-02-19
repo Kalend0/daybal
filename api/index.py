@@ -441,156 +441,170 @@ async def get_comparison_data(
 
 
 @app.get("/api/backfill")
-async def backfill_historical(account_uid: str = None):
+async def backfill_historical(account_uid: str = None, offset_months: int = 0):
     """
-    Populate daily_balances with up to 24 months of history from Enable Banking
-    transaction data. Call once after initial setup.
-    Uses balance_after_transaction if available; otherwise reconstructs from
-    current balance by reversing transactions chronologically.
+    Fetch one month of transaction history and save daily balances.
+    Capped to one month per call to stay within Vercel's 10-second timeout.
+    Call with offset_months=0,1,2,...,23 to fill 24 months of history.
+
+    Examples:
+      /api/backfill?account_uid=<uid>&offset_months=0   → current month
+      /api/backfill?account_uid=<uid>&offset_months=1   → 1 month ago
     """
-    uid = account_uid
-    if not uid:
-        try:
-            session = get_active_session()
-            if session:
-                uid = session["account_uid"]
-        except Exception:
-            pass
-    if not uid:
-        return {"error": True, "detail": "No account UID available"}
-
-    # Anchor: current balance
-    balance_response = await get_balance(account_uid=uid)
-    if balance_response.get("error"):
-        return {"error": True, "detail": "Failed to fetch current balance"}
-
-    current_balance = balance_response["balance"]
-    currency = balance_response.get("currency", "EUR")
-
-    # Fetch all transactions for the past 24 months (handle pagination)
-    date_from = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
-    date_to = datetime.now().strftime("%Y-%m-%d")
-    all_transactions = []
-
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            continuation_key = None
-            while True:
-                params = {"date_from": date_from, "date_to": date_to}
-                if continuation_key:
-                    params["continuation_key"] = continuation_key
+        # Resolve account UID
+        uid = account_uid
+        if not uid:
+            try:
+                session = get_active_session()
+                if session:
+                    uid = session["account_uid"]
+            except Exception as e:
+                return {"error": True, "step": "get_session", "detail": str(e)}
+        if not uid:
+            return {"error": True, "step": "resolve_uid",
+                    "detail": "No account UID. Pass ?account_uid=<uid> or reconnect your bank."}
 
-                response = await client.get(
-                    f"{EB_API_URL}/accounts/{uid}/transactions",
-                    headers=get_auth_headers(),
-                    params=params,
+        # Compute date window: one calendar month
+        today = datetime.now()
+        # Go back offset_months from the current month
+        month = today.month - offset_months
+        year = today.year + (month - 1) // 12
+        month = ((month - 1) % 12) + 1
+        first_of_month = datetime(year, month, 1)
+        if month == 12:
+            last_of_month = datetime(year + 1, 1, 1) - timedelta(days=1)
+        else:
+            last_of_month = datetime(year, month + 1, 1) - timedelta(days=1)
+        date_from = first_of_month.strftime("%Y-%m-%d")
+        date_to = min(last_of_month, today).strftime("%Y-%m-%d")
+
+        # Fetch current balance as reconstruction anchor
+        try:
+            balance_response = await get_balance(account_uid=uid)
+        except Exception as e:
+            return {"error": True, "step": "get_balance", "detail": f"{type(e).__name__}: {e}"}
+
+        if balance_response.get("error"):
+            return {"error": True, "step": "get_balance", "detail": balance_response.get("detail")}
+
+        current_balance = balance_response["balance"]
+        currency = balance_response.get("currency", "EUR")
+
+        # Fetch transactions for the one-month window
+        all_transactions = []
+        raw_sample = None
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                continuation_key = None
+                while True:
+                    params = {"date_from": date_from, "date_to": date_to}
+                    if continuation_key:
+                        params["continuation_key"] = continuation_key
+
+                    response = await client.get(
+                        f"{EB_API_URL}/accounts/{uid}/transactions",
+                        headers=get_auth_headers(),
+                        params=params,
+                    )
+                    if response.status_code != 200:
+                        return {
+                            "error": True,
+                            "step": "fetch_transactions",
+                            "status": response.status_code,
+                            "detail": response.text[:500],
+                        }
+
+                    data = response.json()
+                    # Capture one transaction's keys on first page so we can see the format
+                    if raw_sample is None:
+                        txns_preview = data.get("transactions", [])
+                        raw_sample = {
+                            "top_level_keys": list(data.keys()),
+                            "first_transaction": txns_preview[0] if txns_preview else None,
+                        }
+
+                    all_transactions.extend(data.get("transactions", []))
+                    continuation_key = data.get("continuation_key")
+                    if not continuation_key:
+                        break
+        except Exception as e:
+            return {"error": True, "step": "fetch_transactions",
+                    "detail": f"{type(e).__name__}: {e}"}
+
+        if not all_transactions:
+            return {
+                "success": True,
+                "date_from": date_from,
+                "date_to": date_to,
+                "transactions_fetched": 0,
+                "days_saved": 0,
+                "note": "No transactions in this period",
+                "raw_sample": raw_sample,
+            }
+
+        # Use balance_after_transaction if the bank provides it, else reconstruct
+        has_balance_after = any(t.get("balance_after_transaction") for t in all_transactions)
+        daily_map: dict[str, float] = {}
+
+        if has_balance_after:
+            for txn in all_transactions:
+                bal = txn.get("balance_after_transaction")
+                if not bal:
+                    continue
+                date_str = txn.get("booking_date")
+                amount_str = (
+                    bal.get("balance_amount", {}).get("amount")
+                    or bal.get("amount", {}).get("amount")
                 )
-                if response.status_code != 200:
-                    return {
-                        "error": True,
-                        "status": response.status_code,
-                        "detail": response.text,
-                    }
-
-                data = response.json()
-                transactions = data.get("transactions", [])
-                all_transactions.extend(transactions)
-
-                continuation_key = data.get("continuation_key")
-                if not continuation_key:
-                    break
-    except Exception as e:
-        return {"error": True, "detail": f"Failed to fetch transactions: {e}"}
-
-    if not all_transactions:
-        return {"error": True, "detail": "No transactions returned from Enable Banking"}
-
-    # Determine strategy: use balance_after_transaction if present
-    has_balance_after = any(t.get("balance_after_transaction") for t in all_transactions)
-
-    daily_map: dict[str, float] = {}  # date -> closing balance
-
-    def is_valid_amount(val: float) -> bool:
-        """Check if amount is reasonable (not NaN, Inf, or absurdly large)."""
-        import math
-        if math.isnan(val) or math.isinf(val):
-            return False
-        if abs(val) > 1e12:  # > 1 trillion is suspicious
-            return False
-        return True
-
-    if has_balance_after:
-        # Direct: pick the last balance_after_transaction for each date
-        for txn in all_transactions:
-            bal = txn.get("balance_after_transaction")
-            if not bal:
-                continue
-            date_str = txn.get("booking_date")
-            amount_str = (
-                bal.get("balance_amount", {}).get("amount")
-                or bal.get("amount", {}).get("amount")
+                if date_str and amount_str:
+                    try:
+                        daily_map[date_str] = float(amount_str)
+                    except (ValueError, TypeError):
+                        pass
+        else:
+            sorted_txns = sorted(
+                all_transactions,
+                key=lambda t: t.get("booking_date", ""),
+                reverse=True,
             )
-            if date_str and amount_str:
+            running = current_balance
+            for txn in sorted_txns:
+                date_str = txn.get("booking_date")
                 try:
-                    amount_val = float(amount_str)
-                    if is_valid_amount(amount_val):
-                        daily_map[date_str] = amount_val
+                    amount = float(txn.get("amount", {}).get("amount", 0))
                 except (ValueError, TypeError):
                     continue
-    else:
-        # Reconstruct: start from today's balance and work backwards
-        sorted_txns = sorted(
-            all_transactions,
-            key=lambda t: t.get("booking_date", ""),
-            reverse=True,  # newest first
-        )
-        running = current_balance
-        skipped_invalid = 0
-        for txn in sorted_txns:
-            date_str = txn.get("booking_date")
-            raw_amount = txn.get("amount", {})
+                if date_str and date_str not in daily_map:
+                    daily_map[date_str] = running
+                indicator = txn.get("credit_debit_indicator", "CRDT")
+                if indicator == "CRDT":
+                    running -= amount
+                else:
+                    running += amount
+
+        saved, errors = 0, []
+        for date_str, balance in daily_map.items():
             try:
-                amount = float(raw_amount.get("amount", 0))
-            except (ValueError, TypeError):
-                skipped_invalid += 1
-                continue
+                upsert_daily_balance(date_str, balance, currency)
+                saved += 1
+            except Exception as e:
+                errors.append(f"{date_str}: {e}")
 
-            # Validate amount before using it
-            if not is_valid_amount(amount):
-                skipped_invalid += 1
-                continue
+        return {
+            "success": True,
+            "date_from": date_from,
+            "date_to": date_to,
+            "offset_months": offset_months,
+            "transactions_fetched": len(all_transactions),
+            "days_saved": saved,
+            "method": "balance_after_transaction" if has_balance_after else "reconstruction",
+            "errors": errors[:5],
+            "raw_sample": raw_sample,
+        }
 
-            # Record running balance as end-of-day for this date (first time we see it)
-            if date_str and date_str not in daily_map:
-                daily_map[date_str] = running
-
-            # Reverse the transaction to get the balance before it
-            indicator = txn.get("credit_debit_indicator", "CRDT")
-            if indicator == "CRDT":
-                running -= amount
-            else:
-                running += amount
-
-            # Safety check: if running balance becomes unreasonable, stop
-            if not is_valid_amount(running):
-                break
-
-    # Upsert into daily_balances
-    saved, errors = 0, []
-    for date_str, balance in daily_map.items():
-        try:
-            upsert_daily_balance(date_str, balance, currency)
-            saved += 1
-        except Exception as e:
-            errors.append(f"{date_str}: {e}")
-
-    return {
-        "success": True,
-        "transactions_fetched": len(all_transactions),
-        "days_saved": saved,
-        "method": "balance_after_transaction" if has_balance_after else "reconstruction",
-        "errors": errors[:10],
-    }
+    except Exception as e:
+        return {"error": True, "step": "unhandled", "detail": f"{type(e).__name__}: {e}"}
 
 
 @app.get("/api/record-balance")
