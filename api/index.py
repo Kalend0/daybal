@@ -625,6 +625,38 @@ async def backfill_historical(account_uid: str = None, offset_months: int = 0):
         return {"error": True, "step": "unhandled", "detail": f"{type(e).__name__}: {e}"}
 
 
+@app.get("/api/debug-transactions")
+async def debug_transactions(account_uid: str):
+    """Return the raw Enable Banking transactions response for inspection."""
+    try:
+        today = datetime.now()
+        date_from = today.replace(day=1).strftime("%Y-%m-%d")
+        date_to = today.strftime("%Y-%m-%d")
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            response = await client.get(
+                f"{EB_API_URL}/accounts/{account_uid}/transactions",
+                headers=get_auth_headers(),
+                params={"date_from": date_from, "date_to": date_to},
+            )
+            data = response.json()
+            # Return the structure and first 2 transactions without modification
+            txns_raw = data.get("transactions", "__key_missing__")
+            return {
+                "status": response.status_code,
+                "top_level_keys": list(data.keys()),
+                "transactions_value_type": type(txns_raw).__name__,
+                "transactions_sub_keys": list(txns_raw.keys()) if isinstance(txns_raw, dict) else None,
+                "first_2_transactions": (
+                    txns_raw[:2] if isinstance(txns_raw, list)
+                    else txns_raw.get("booked", [])[:2] if isinstance(txns_raw, dict)
+                    else txns_raw
+                ),
+                "raw_data_keys_only": {k: type(v).__name__ for k, v in data.items()},
+            }
+    except Exception as e:
+        return {"error": True, "detail": f"{type(e).__name__}: {e}"}
+
+
 @app.get("/api/record-balance")
 async def record_balance():
     """
