@@ -465,19 +465,18 @@ async def backfill_historical(account_uid: str = None, offset_months: int = 0):
             return {"error": True, "step": "resolve_uid",
                     "detail": "No account UID. Pass ?account_uid=<uid> or reconnect your bank."}
 
-        # Compute date window: one calendar month
+        # Compute the target month (the one we want daily balances for)
         today = datetime.now()
-        # Go back offset_months from the current month
         month = today.month - offset_months
         year = today.year + (month - 1) // 12
         month = ((month - 1) % 12) + 1
-        first_of_month = datetime(year, month, 1)
-        if month == 12:
-            last_of_month = datetime(year + 1, 1, 1) - timedelta(days=1)
-        else:
-            last_of_month = datetime(year, month + 1, 1) - timedelta(days=1)
-        date_from = first_of_month.strftime("%Y-%m-%d")
-        date_to = min(last_of_month, today).strftime("%Y-%m-%d")
+        first_of_target = datetime(year, month, 1)
+
+        # Always fetch from the start of the target month to TODAY so the
+        # reconstruction anchor (today's balance) can be correctly reversed
+        # through all intervening transactions.
+        date_from = first_of_target.strftime("%Y-%m-%d")
+        date_to = today.strftime("%Y-%m-%d")
 
         # Fetch current balance as reconstruction anchor
         try:
@@ -491,7 +490,11 @@ async def backfill_historical(account_uid: str = None, offset_months: int = 0):
         current_balance = balance_response["balance"]
         currency = balance_response.get("currency", "EUR")
 
-        # Fetch transactions for the one-month window
+        def is_valid_amount(val: float) -> bool:
+            import math
+            return not (math.isnan(val) or math.isinf(val) or abs(val) > 1e12)
+
+        # Fetch all transactions from target month start → today
         all_transactions = []
         raw_sample = None
         try:
@@ -516,7 +519,6 @@ async def backfill_historical(account_uid: str = None, offset_months: int = 0):
                         }
 
                     data = response.json()
-                    # Capture one transaction's keys on first page so we can see the format
                     if raw_sample is None:
                         txns_preview = data.get("transactions", [])
                         raw_sample = {
@@ -543,7 +545,9 @@ async def backfill_historical(account_uid: str = None, offset_months: int = 0):
                 "raw_sample": raw_sample,
             }
 
-        # Use balance_after_transaction if the bank provides it, else reconstruct
+        # Use balance_after_transaction if the bank provides it; else reconstruct.
+        # Reconstruction reverses transactions newest→oldest from today's balance,
+        # so we get an accurate running balance for every date in the target month.
         has_balance_after = any(t.get("balance_after_transaction") for t in all_transactions)
         daily_map: dict[str, float] = {}
 
@@ -559,10 +563,13 @@ async def backfill_historical(account_uid: str = None, offset_months: int = 0):
                 )
                 if date_str and amount_str:
                     try:
-                        daily_map[date_str] = float(amount_str)
+                        val = float(amount_str)
+                        if is_valid_amount(val):
+                            daily_map[date_str] = val
                     except (ValueError, TypeError):
                         pass
         else:
+            # Sort newest-first, reverse from today's balance
             sorted_txns = sorted(
                 all_transactions,
                 key=lambda t: t.get("booking_date", ""),
@@ -575,13 +582,16 @@ async def backfill_historical(account_uid: str = None, offset_months: int = 0):
                     amount = float(txn.get("amount", {}).get("amount", 0))
                 except (ValueError, TypeError):
                     continue
-                if date_str and date_str not in daily_map:
-                    daily_map[date_str] = running
+                if not is_valid_amount(amount):
+                    continue
+                # Only record dates inside the target month
+                if date_str and date_str >= first_of_target.strftime("%Y-%m-%d"):
+                    if date_str not in daily_map:
+                        daily_map[date_str] = running
                 indicator = txn.get("credit_debit_indicator", "CRDT")
-                if indicator == "CRDT":
-                    running -= amount
-                else:
-                    running += amount
+                running = running - amount if indicator == "CRDT" else running + amount
+                if not is_valid_amount(running):
+                    break
 
         saved, errors = 0, []
         for date_str, balance in daily_map.items():
