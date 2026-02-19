@@ -4,5 +4,8 @@
   "rewrites": [
     { "source": "/api/(.*)", "destination": "/api/index.py" },
     { "source": "/(.*)", "destination": "/index.html" }
+  ],
+  "crons": [
+    { "path": "/api/record-balance", "schedule": "55 23 * * *" }
   ]
 }

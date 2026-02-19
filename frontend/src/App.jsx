@@ -313,6 +313,10 @@ function App() {
         const statusData = await statusRes.json()
 
         if (statusData.bank_connected) {
+          // Store account_uid returned from DB session so fetchBalanceData can use it
+          if (statusData.account_uid) {
+            localStorage.setItem('daybal_account_uid', statusData.account_uid)
+          }
           await fetchBalanceData()
           setAppState('dashboard')
         } else {
