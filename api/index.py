@@ -519,14 +519,22 @@ async def backfill_historical(account_uid: str = None, offset_months: int = 0):
                         }
 
                     data = response.json()
+                    # EB returns transactions as {"booked": [...], "pending": [...]}
+                    txns_obj = data.get("transactions", {})
+                    if isinstance(txns_obj, list):
+                        page_txns = txns_obj
+                    else:
+                        page_txns = txns_obj.get("booked", []) + txns_obj.get("pending", [])
+
                     if raw_sample is None:
-                        txns_preview = data.get("transactions", [])
                         raw_sample = {
                             "top_level_keys": list(data.keys()),
-                            "first_transaction": txns_preview[0] if txns_preview else None,
+                            "transactions_type": type(txns_obj).__name__,
+                            "transactions_keys": list(txns_obj.keys()) if isinstance(txns_obj, dict) else "list",
+                            "first_transaction": page_txns[0] if page_txns else None,
                         }
 
-                    all_transactions.extend(data.get("transactions", []))
+                    all_transactions.extend(page_txns)
                     continuation_key = data.get("continuation_key")
                     if not continuation_key:
                         break
