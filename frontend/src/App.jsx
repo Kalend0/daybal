@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import React, { useState, useEffect, useRef } from 'react'
 
 const API_BASE = '/api'
 
@@ -386,14 +386,20 @@ function App() {
     await fetchBalanceData(medianMonths, averageMonths)
   }
 
+  // Use refs to track latest values and avoid stale state in rapid clicks
+  const medianMonthsRef = useRef(medianMonths)
+  const averageMonthsRef = useRef(averageMonths)
+
   const handleMedianChange = async (months) => {
+    medianMonthsRef.current = months
     setMedianMonths(months)
-    await fetchBalanceData(months, averageMonths)
+    await fetchBalanceData(months, averageMonthsRef.current)
   }
 
   const handleAverageChange = async (months) => {
+    averageMonthsRef.current = months
     setAverageMonths(months)
-    await fetchBalanceData(medianMonths, months)
+    await fetchBalanceData(medianMonthsRef.current, months)
   }
 
   const handleBankConnected = () => {

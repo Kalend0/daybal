@@ -510,6 +510,15 @@ async def backfill_historical(account_uid: str = None):
 
     daily_map: dict[str, float] = {}  # date -> closing balance
 
+    def is_valid_amount(val: float) -> bool:
+        """Check if amount is reasonable (not NaN, Inf, or absurdly large)."""
+        import math
+        if math.isnan(val) or math.isinf(val):
+            return False
+        if abs(val) > 1e12:  # > 1 trillion is suspicious
+            return False
+        return True
+
     if has_balance_after:
         # Direct: pick the last balance_after_transaction for each date
         for txn in all_transactions:
@@ -522,7 +531,12 @@ async def backfill_historical(account_uid: str = None):
                 or bal.get("amount", {}).get("amount")
             )
             if date_str and amount_str:
-                daily_map[date_str] = float(amount_str)
+                try:
+                    amount_val = float(amount_str)
+                    if is_valid_amount(amount_val):
+                        daily_map[date_str] = amount_val
+                except (ValueError, TypeError):
+                    continue
     else:
         # Reconstruct: start from today's balance and work backwards
         sorted_txns = sorted(
@@ -531,12 +545,19 @@ async def backfill_historical(account_uid: str = None):
             reverse=True,  # newest first
         )
         running = current_balance
+        skipped_invalid = 0
         for txn in sorted_txns:
             date_str = txn.get("booking_date")
             raw_amount = txn.get("amount", {})
             try:
                 amount = float(raw_amount.get("amount", 0))
             except (ValueError, TypeError):
+                skipped_invalid += 1
+                continue
+
+            # Validate amount before using it
+            if not is_valid_amount(amount):
+                skipped_invalid += 1
                 continue
 
             # Record running balance as end-of-day for this date (first time we see it)
@@ -549,6 +570,10 @@ async def backfill_historical(account_uid: str = None):
                 running -= amount
             else:
                 running += amount
+
+            # Safety check: if running balance becomes unreasonable, stop
+            if not is_valid_amount(running):
+                break
 
     # Upsert into daily_balances
     saved, errors = 0, []
