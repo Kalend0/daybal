@@ -138,7 +138,7 @@ def get_historical_balances(day_of_month: int, months: int) -> list[float]:
                 SELECT balance_amount
                 FROM daily_balances
                 WHERE EXTRACT(DAY FROM recorded_date) = %s
-                  AND recorded_date >= NOW() - INTERVAL '%s months'
+                  AND recorded_date >= NOW() - (%s * INTERVAL '1 month')
                 ORDER BY recorded_date DESC
                 """,
                 (day_of_month, months)
@@ -395,8 +395,12 @@ async def get_balance(account_uid: str = None):
 
 
 @app.get("/api/comparison-data")
-async def get_comparison_data(account_uid: str = None):
-    """Current balance vs 12-month median and 24-month average (same day-of-month)."""
+async def get_comparison_data(
+    account_uid: str = None,
+    median_months: int = 12,
+    average_months: int = 24,
+):
+    """Current balance vs N-month median and M-month average (same day-of-month)."""
     balance_response = await get_balance(account_uid=account_uid)
     if balance_response.get("error"):
         return balance_response
@@ -406,20 +410,20 @@ async def get_comparison_data(account_uid: str = None):
     today = datetime.now()
     day_of_month = today.day
 
-    median_12m = None
-    average_24m = None
+    median_val = None
+    average_val = None
     historical_data_available = False
 
     try:
-        values_12m = get_historical_balances(day_of_month, months=12)
-        values_24m = get_historical_balances(day_of_month, months=24)
+        values_median = get_historical_balances(day_of_month, months=median_months)
+        values_average = get_historical_balances(day_of_month, months=average_months)
 
-        if values_12m:
-            median_12m = median(values_12m)
-        if values_24m:
-            average_24m = sum(values_24m) / len(values_24m)
+        if values_median:
+            median_val = median(values_median)
+        if values_average:
+            average_val = sum(values_average) / len(values_average)
 
-        historical_data_available = bool(values_12m or values_24m)
+        historical_data_available = bool(values_median or values_average)
     except Exception as e:
         print(f"DB historical query error: {e}")
 
@@ -428,9 +432,139 @@ async def get_comparison_data(account_uid: str = None):
         "currency": currency,
         "date": balance_response.get("date"),
         "day_of_month": day_of_month,
-        "median_12m": median_12m,
-        "average_24m": average_24m,
+        "median_months": median_months,
+        "average_months": average_months,
+        "median_val": median_val,
+        "average_val": average_val,
         "historical_data_available": historical_data_available,
+    }
+
+
+@app.get("/api/backfill")
+async def backfill_historical(account_uid: str = None):
+    """
+    Populate daily_balances with up to 24 months of history from Enable Banking
+    transaction data. Call once after initial setup.
+    Uses balance_after_transaction if available; otherwise reconstructs from
+    current balance by reversing transactions chronologically.
+    """
+    uid = account_uid
+    if not uid:
+        try:
+            session = get_active_session()
+            if session:
+                uid = session["account_uid"]
+        except Exception:
+            pass
+    if not uid:
+        return {"error": True, "detail": "No account UID available"}
+
+    # Anchor: current balance
+    balance_response = await get_balance(account_uid=uid)
+    if balance_response.get("error"):
+        return {"error": True, "detail": "Failed to fetch current balance"}
+
+    current_balance = balance_response["balance"]
+    currency = balance_response.get("currency", "EUR")
+
+    # Fetch all transactions for the past 24 months (handle pagination)
+    date_from = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
+    date_to = datetime.now().strftime("%Y-%m-%d")
+    all_transactions = []
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            continuation_key = None
+            while True:
+                params = {"date_from": date_from, "date_to": date_to}
+                if continuation_key:
+                    params["continuation_key"] = continuation_key
+
+                response = await client.get(
+                    f"{EB_API_URL}/accounts/{uid}/transactions",
+                    headers=get_auth_headers(),
+                    params=params,
+                )
+                if response.status_code != 200:
+                    return {
+                        "error": True,
+                        "status": response.status_code,
+                        "detail": response.text,
+                    }
+
+                data = response.json()
+                transactions = data.get("transactions", [])
+                all_transactions.extend(transactions)
+
+                continuation_key = data.get("continuation_key")
+                if not continuation_key:
+                    break
+    except Exception as e:
+        return {"error": True, "detail": f"Failed to fetch transactions: {e}"}
+
+    if not all_transactions:
+        return {"error": True, "detail": "No transactions returned from Enable Banking"}
+
+    # Determine strategy: use balance_after_transaction if present
+    has_balance_after = any(t.get("balance_after_transaction") for t in all_transactions)
+
+    daily_map: dict[str, float] = {}  # date -> closing balance
+
+    if has_balance_after:
+        # Direct: pick the last balance_after_transaction for each date
+        for txn in all_transactions:
+            bal = txn.get("balance_after_transaction")
+            if not bal:
+                continue
+            date_str = txn.get("booking_date")
+            amount_str = (
+                bal.get("balance_amount", {}).get("amount")
+                or bal.get("amount", {}).get("amount")
+            )
+            if date_str and amount_str:
+                daily_map[date_str] = float(amount_str)
+    else:
+        # Reconstruct: start from today's balance and work backwards
+        sorted_txns = sorted(
+            all_transactions,
+            key=lambda t: t.get("booking_date", ""),
+            reverse=True,  # newest first
+        )
+        running = current_balance
+        for txn in sorted_txns:
+            date_str = txn.get("booking_date")
+            raw_amount = txn.get("amount", {})
+            try:
+                amount = float(raw_amount.get("amount", 0))
+            except (ValueError, TypeError):
+                continue
+
+            # Record running balance as end-of-day for this date (first time we see it)
+            if date_str and date_str not in daily_map:
+                daily_map[date_str] = running
+
+            # Reverse the transaction to get the balance before it
+            indicator = txn.get("credit_debit_indicator", "CRDT")
+            if indicator == "CRDT":
+                running -= amount
+            else:
+                running += amount
+
+    # Upsert into daily_balances
+    saved, errors = 0, []
+    for date_str, balance in daily_map.items():
+        try:
+            upsert_daily_balance(date_str, balance, currency)
+            saved += 1
+        except Exception as e:
+            errors.append(f"{date_str}: {e}")
+
+    return {
+        "success": True,
+        "transactions_fetched": len(all_transactions),
+        "days_saved": saved,
+        "method": "balance_after_transaction" if has_balance_after else "reconstruction",
+        "errors": errors[:10],
     }
 
 

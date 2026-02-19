@@ -80,8 +80,29 @@ function PinKeypad({ onSubmit, error, locked, lockoutSeconds }) {
   )
 }
 
+const INTERVAL_OPTIONS = [3, 6, 12, 24]
+
+function IntervalPicker({ value, onChange }) {
+  return (
+    <div style={styles.intervalPicker}>
+      {INTERVAL_OPTIONS.map(m => (
+        <button
+          key={m}
+          style={{
+            ...styles.intervalOption,
+            ...(value === m ? styles.intervalOptionActive : {})
+          }}
+          onClick={() => onChange(m)}
+        >
+          {m}m
+        </button>
+      ))}
+    </div>
+  )
+}
+
 // Balance Display Component
-function BalanceDisplay({ data, onRefresh }) {
+function BalanceDisplay({ data, medianMonths, averageMonths, onMedianChange, onAverageChange, onRefresh }) {
   const formatCurrency = (amount, currency = 'EUR') => {
     return new Intl.NumberFormat('nl-NL', {
       style: 'currency',
@@ -114,43 +135,45 @@ function BalanceDisplay({ data, onRefresh }) {
 
       <div style={styles.comparisons}>
         <div style={styles.comparisonCard}>
-          <p style={styles.comparisonLabel}>12-Month Median</p>
+          <p style={styles.comparisonLabel}>{medianMonths}-Month Median</p>
+          <IntervalPicker value={medianMonths} onChange={onMedianChange} />
           <p style={{
             ...styles.comparisonValue,
-            color: getComparisonColor(data.current_balance, data.median_12m)
+            color: getComparisonColor(data.current_balance, data.median_val)
           }}>
-            {data.median_12m !== null
-              ? formatCurrency(data.median_12m, data.currency)
+            {data.median_val !== null && data.median_val !== undefined
+              ? formatCurrency(data.median_val, data.currency)
               : '—'}
           </p>
-          {data.median_12m !== null && (
+          {data.median_val !== null && data.median_val !== undefined && (
             <p style={{
               ...styles.comparisonDiff,
-              color: getComparisonColor(data.current_balance, data.median_12m)
+              color: getComparisonColor(data.current_balance, data.median_val)
             }}>
-              {data.current_balance >= data.median_12m ? '+' : ''}
-              {formatCurrency(data.current_balance - data.median_12m, data.currency)}
+              {data.current_balance >= data.median_val ? '+' : ''}
+              {formatCurrency(data.current_balance - data.median_val, data.currency)}
             </p>
           )}
         </div>
 
         <div style={styles.comparisonCard}>
-          <p style={styles.comparisonLabel}>24-Month Average</p>
+          <p style={styles.comparisonLabel}>{averageMonths}-Month Average</p>
+          <IntervalPicker value={averageMonths} onChange={onAverageChange} />
           <p style={{
             ...styles.comparisonValue,
-            color: getComparisonColor(data.current_balance, data.average_24m)
+            color: getComparisonColor(data.current_balance, data.average_val)
           }}>
-            {data.average_24m !== null
-              ? formatCurrency(data.average_24m, data.currency)
+            {data.average_val !== null && data.average_val !== undefined
+              ? formatCurrency(data.average_val, data.currency)
               : '—'}
           </p>
-          {data.average_24m !== null && (
+          {data.average_val !== null && data.average_val !== undefined && (
             <p style={{
               ...styles.comparisonDiff,
-              color: getComparisonColor(data.current_balance, data.average_24m)
+              color: getComparisonColor(data.current_balance, data.average_val)
             }}>
-              {data.current_balance >= data.average_24m ? '+' : ''}
-              {formatCurrency(data.current_balance - data.average_24m, data.currency)}
+              {data.current_balance >= data.average_val ? '+' : ''}
+              {formatCurrency(data.current_balance - data.average_val, data.currency)}
             </p>
           )}
         </div>
@@ -233,6 +256,8 @@ function App() {
   const [lockoutSeconds, setLockoutSeconds] = useState(0)
   const [balanceData, setBalanceData] = useState(null)
   const [callbackMessage, setCallbackMessage] = useState('')
+  const [medianMonths, setMedianMonths] = useState(12)
+  const [averageMonths, setAverageMonths] = useState(24)
 
   useEffect(() => {
     console.log('App mounted, checking initial state...')
@@ -334,37 +359,41 @@ function App() {
     }
   }
 
-  const fetchBalanceData = async () => {
+  const fetchBalanceData = async (medMonths = medianMonths, avgMonths = averageMonths) => {
     try {
       const accountUid = localStorage.getItem('daybal_account_uid')
-      console.log('Fetching comparison data with account_uid:', accountUid)
-
-      const url = accountUid
-        ? `${API_BASE}/comparison-data?account_uid=${accountUid}`
-        : `${API_BASE}/comparison-data`
+      const params = new URLSearchParams({ median_months: medMonths, average_months: avgMonths })
+      if (accountUid) params.set('account_uid', accountUid)
+      const url = `${API_BASE}/comparison-data?${params.toString()}`
 
       const res = await fetch(url)
-      console.log('Comparison data status:', res.status)
       const data = await res.json()
-      console.log('Comparison data:', data)
 
       if (!data.error) {
         setBalanceData(data)
         return true
       } else {
-        console.error('Balance API error:', data.detail)
         setBalanceData({ error: true, detail: data.detail })
         return false
       }
     } catch (err) {
-      console.error('Failed to fetch balance:', err)
       setBalanceData({ error: true, detail: err.message })
       return false
     }
   }
 
   const handleRefresh = async () => {
-    await fetchBalanceData()
+    await fetchBalanceData(medianMonths, averageMonths)
+  }
+
+  const handleMedianChange = async (months) => {
+    setMedianMonths(months)
+    await fetchBalanceData(months, averageMonths)
+  }
+
+  const handleAverageChange = async (months) => {
+    setAverageMonths(months)
+    await fetchBalanceData(medianMonths, months)
   }
 
   const handleBankConnected = () => {
@@ -426,7 +455,14 @@ function App() {
     if (balanceData) {
       return (
         <div style={styles.container}>
-          <BalanceDisplay data={balanceData} onRefresh={handleRefresh} />
+          <BalanceDisplay
+            data={balanceData}
+            medianMonths={medianMonths}
+            averageMonths={averageMonths}
+            onMedianChange={handleMedianChange}
+            onAverageChange={handleAverageChange}
+            onRefresh={handleRefresh}
+          />
         </div>
       )
     }
@@ -564,6 +600,29 @@ const styles = {
   comparisonDiff: {
     fontSize: 12,
     marginTop: 4
+  },
+  intervalPicker: {
+    display: 'flex',
+    gap: 4,
+    justifyContent: 'center',
+    marginBottom: 8,
+    marginTop: 2,
+  },
+  intervalOption: {
+    padding: '2px 7px',
+    fontSize: 10,
+    fontWeight: '600',
+    border: '1px solid #444',
+    borderRadius: 20,
+    background: 'transparent',
+    color: '#555',
+    cursor: 'pointer',
+    lineHeight: '1.6',
+  },
+  intervalOptionActive: {
+    borderColor: '#4a90d9',
+    color: '#4a90d9',
+    background: 'rgba(74, 144, 217, 0.12)',
   },
   infoMessage: {
     fontSize: 12,
