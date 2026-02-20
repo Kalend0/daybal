@@ -129,19 +129,28 @@ def upsert_daily_balance(date: str, amount: float, currency: str = "EUR"):
 
 
 def get_historical_balances(day_of_month: int, months: int) -> list[float]:
-    """Return balance amounts for the same day-of-month over the last N months."""
+    """
+    Return one balance per calendar month for the last N months.
+    Picks the record closest to day_of_month within each month,
+    so the result is meaningful even when there is no transaction
+    on the exact target day.
+    """
     conn = get_db()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT balance_amount
+                SELECT DISTINCT ON (DATE_TRUNC('month', recorded_date))
+                    balance_amount
                 FROM daily_balances
-                WHERE EXTRACT(DAY FROM recorded_date) = %s
-                  AND recorded_date >= NOW() - (%s * INTERVAL '1 month')
-                ORDER BY recorded_date DESC
+                WHERE recorded_date >= NOW() - (%s * INTERVAL '1 month')
+                  AND recorded_date < NOW()
+                ORDER BY
+                    DATE_TRUNC('month', recorded_date),
+                    ABS(EXTRACT(DAY FROM recorded_date) - %s),
+                    recorded_date DESC
                 """,
-                (day_of_month, months)
+                (months, day_of_month)
             )
             return [float(row[0]) for row in cur.fetchall()]
     finally:
