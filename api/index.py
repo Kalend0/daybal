@@ -560,42 +560,42 @@ async def backfill_historical(account_uid: str = None, offset_months: int = 0):
         daily_map: dict[str, float] = {}
 
         if has_balance_after:
+            # ABN AMRO via Enable Banking: balance_after_transaction = {"currency": "EUR", "amount": "2550.9"}
+            # Keep the LAST balance recorded per date (transactions are in order, last = end-of-day)
             for txn in all_transactions:
                 bal = txn.get("balance_after_transaction")
-                if not bal:
+                if not isinstance(bal, dict):
                     continue
                 date_str = txn.get("booking_date")
-                amount_str = (
-                    bal.get("balance_amount", {}).get("amount")
-                    or bal.get("amount", {}).get("amount")
-                )
-                if date_str and amount_str:
+                amount_str = bal.get("amount")  # directly on the dict, not nested
+                if date_str and amount_str is not None:
                     try:
                         val = float(amount_str)
                         if is_valid_amount(val):
-                            daily_map[date_str] = val
+                            daily_map[date_str] = val  # last txn of the day wins
                     except (ValueError, TypeError):
                         pass
         else:
-            # Sort newest-first, reverse from today's balance
+            # Fallback: reconstruct from current balance going backwards
             sorted_txns = sorted(
                 all_transactions,
                 key=lambda t: t.get("booking_date", ""),
                 reverse=True,
             )
             running = current_balance
+            target_prefix = first_of_target.strftime("%Y-%m-%d")
             for txn in sorted_txns:
                 date_str = txn.get("booking_date")
                 try:
-                    amount = float(txn.get("amount", {}).get("amount", 0))
-                except (ValueError, TypeError):
+                    # EB field is transaction_amount.amount
+                    txn_amount = txn.get("transaction_amount", {})
+                    amount = float(txn_amount.get("amount", 0) if isinstance(txn_amount, dict) else txn_amount)
+                except (ValueError, TypeError, AttributeError):
                     continue
                 if not is_valid_amount(amount):
                     continue
-                # Only record dates inside the target month
-                if date_str and date_str >= first_of_target.strftime("%Y-%m-%d"):
-                    if date_str not in daily_map:
-                        daily_map[date_str] = running
+                if date_str and date_str >= target_prefix and date_str not in daily_map:
+                    daily_map[date_str] = running
                 indicator = txn.get("credit_debit_indicator", "CRDT")
                 running = running - amount if indicator == "CRDT" else running + amount
                 if not is_valid_amount(running):
