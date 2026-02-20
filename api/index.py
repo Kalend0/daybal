@@ -452,16 +452,13 @@ async def get_comparison_data(
 @app.get("/api/backfill")
 async def backfill_historical(account_uid: str = None, offset_months: int = 0):
     """
-    Fetch one month of transaction history and save daily balances.
-    Capped to one month per call to stay within Vercel's 10-second timeout.
-    Call with offset_months=0,1,2,...,23 to fill 24 months of history.
+    Store end-of-day balances for one calendar month using balance_after_transaction
+    values from Enable Banking transactions. Only the target month is fetched, so
+    each call is fast regardless of how far back offset_months goes.
 
-    Examples:
-      /api/backfill?account_uid=<uid>&offset_months=0   → current month
-      /api/backfill?account_uid=<uid>&offset_months=1   → 1 month ago
+    Run for offset_months = 0, 1, 2, ..., 23 to populate 24 months of history.
     """
     try:
-        # Resolve account UID
         uid = account_uid
         if not uid:
             try:
@@ -474,38 +471,23 @@ async def backfill_historical(account_uid: str = None, offset_months: int = 0):
             return {"error": True, "step": "resolve_uid",
                     "detail": "No account UID. Pass ?account_uid=<uid> or reconnect your bank."}
 
-        # Compute the target month (the one we want daily balances for)
+        # Target month boundaries
         today = datetime.now()
         month = today.month - offset_months
         year = today.year + (month - 1) // 12
         month = ((month - 1) % 12) + 1
-        first_of_target = datetime(year, month, 1)
+        first_of_month = datetime(year, month, 1)
+        if month == 12:
+            last_of_month = datetime(year + 1, 1, 1) - timedelta(days=1)
+        else:
+            last_of_month = datetime(year, month + 1, 1) - timedelta(days=1)
 
-        # Always fetch from the start of the target month to TODAY so the
-        # reconstruction anchor (today's balance) can be correctly reversed
-        # through all intervening transactions.
-        date_from = first_of_target.strftime("%Y-%m-%d")
-        date_to = today.strftime("%Y-%m-%d")
+        # Only fetch the target month — balance_after_transaction is self-contained
+        date_from = first_of_month.strftime("%Y-%m-%d")
+        date_to = min(last_of_month, today).strftime("%Y-%m-%d")
 
-        # Fetch current balance as reconstruction anchor
-        try:
-            balance_response = await get_balance(account_uid=uid)
-        except Exception as e:
-            return {"error": True, "step": "get_balance", "detail": f"{type(e).__name__}: {e}"}
-
-        if balance_response.get("error"):
-            return {"error": True, "step": "get_balance", "detail": balance_response.get("detail")}
-
-        current_balance = balance_response["balance"]
-        currency = balance_response.get("currency", "EUR")
-
-        def is_valid_amount(val: float) -> bool:
-            import math
-            return not (math.isnan(val) or math.isinf(val) or abs(val) > 1e12)
-
-        # Fetch all transactions from target month start → today
+        # Fetch transactions for target month only (fast, bounded)
         all_transactions = []
-        raw_sample = None
         try:
             async with httpx.AsyncClient(timeout=8.0) as client:
                 continuation_key = None
@@ -528,22 +510,12 @@ async def backfill_historical(account_uid: str = None, offset_months: int = 0):
                         }
 
                     data = response.json()
-                    # EB returns transactions as {"booked": [...], "pending": [...]}
-                    txns_obj = data.get("transactions", {})
-                    if isinstance(txns_obj, list):
-                        page_txns = txns_obj
-                    else:
-                        page_txns = txns_obj.get("booked", []) + txns_obj.get("pending", [])
+                    txns = data.get("transactions", [])
+                    # EB returns a flat list for this account
+                    if isinstance(txns, dict):
+                        txns = txns.get("booked", []) + txns.get("pending", [])
+                    all_transactions.extend(txns)
 
-                    if raw_sample is None:
-                        raw_sample = {
-                            "top_level_keys": list(data.keys()),
-                            "transactions_type": type(txns_obj).__name__,
-                            "transactions_keys": list(txns_obj.keys()) if isinstance(txns_obj, dict) else "list",
-                            "first_transaction": page_txns[0] if page_txns else None,
-                        }
-
-                    all_transactions.extend(page_txns)
                     continuation_key = data.get("continuation_key")
                     if not continuation_key:
                         break
@@ -552,68 +524,37 @@ async def backfill_historical(account_uid: str = None, offset_months: int = 0):
                     "detail": f"{type(e).__name__}: {e}"}
 
         if not all_transactions:
-            return {
-                "success": True,
-                "date_from": date_from,
-                "date_to": date_to,
-                "transactions_fetched": 0,
-                "days_saved": 0,
-                "note": "No transactions in this period",
-                "raw_sample": raw_sample,
-            }
+            return {"success": True, "date_from": date_from, "date_to": date_to,
+                    "transactions_fetched": 0, "days_saved": 0,
+                    "note": "No transactions in this period"}
 
-        # Use balance_after_transaction if the bank provides it; else reconstruct.
-        # Reconstruction reverses transactions newest→oldest from today's balance,
-        # so we get an accurate running balance for every date in the target month.
-        has_balance_after = any(t.get("balance_after_transaction") for t in all_transactions)
+        # Extract end-of-day balance from balance_after_transaction.
+        # ABN AMRO format: {"currency": "EUR", "amount": "2550.9"}
+        # Last transaction of each day gives the closing balance for that day.
         daily_map: dict[str, float] = {}
+        no_balance_count = 0
+        for txn in all_transactions:
+            bal = txn.get("balance_after_transaction")
+            if not isinstance(bal, dict):
+                no_balance_count += 1
+                continue
+            date_str = txn.get("booking_date")
+            try:
+                val = float(bal.get("amount", "nan"))
+                if date_str and not (val != val):  # nan check
+                    daily_map[date_str] = val      # last txn of day wins
+            except (ValueError, TypeError):
+                pass
 
-        if has_balance_after:
-            # ABN AMRO via Enable Banking: balance_after_transaction = {"currency": "EUR", "amount": "2550.9"}
-            # Keep the LAST balance recorded per date (transactions are in order, last = end-of-day)
-            for txn in all_transactions:
-                bal = txn.get("balance_after_transaction")
-                if not isinstance(bal, dict):
-                    continue
-                date_str = txn.get("booking_date")
-                amount_str = bal.get("amount")  # directly on the dict, not nested
-                if date_str and amount_str is not None:
-                    try:
-                        val = float(amount_str)
-                        if is_valid_amount(val):
-                            daily_map[date_str] = val  # last txn of the day wins
-                    except (ValueError, TypeError):
-                        pass
-        else:
-            # Fallback: reconstruct from current balance going backwards
-            sorted_txns = sorted(
-                all_transactions,
-                key=lambda t: t.get("booking_date", ""),
-                reverse=True,
-            )
-            running = current_balance
-            target_prefix = first_of_target.strftime("%Y-%m-%d")
-            for txn in sorted_txns:
-                date_str = txn.get("booking_date")
-                try:
-                    # EB field is transaction_amount.amount
-                    txn_amount = txn.get("transaction_amount", {})
-                    amount = float(txn_amount.get("amount", 0) if isinstance(txn_amount, dict) else txn_amount)
-                except (ValueError, TypeError, AttributeError):
-                    continue
-                if not is_valid_amount(amount):
-                    continue
-                if date_str and date_str >= target_prefix and date_str not in daily_map:
-                    daily_map[date_str] = running
-                indicator = txn.get("credit_debit_indicator", "CRDT")
-                running = running - amount if indicator == "CRDT" else running + amount
-                if not is_valid_amount(running):
-                    break
+        if not daily_map and no_balance_count == len(all_transactions):
+            return {"error": True, "step": "parse",
+                    "detail": "No balance_after_transaction found in any transaction. "
+                              "Bank may not support this field."}
 
         saved, errors = 0, []
         for date_str, balance in daily_map.items():
             try:
-                upsert_daily_balance(date_str, balance, currency)
+                upsert_daily_balance(date_str, balance)
                 saved += 1
             except Exception as e:
                 errors.append(f"{date_str}: {e}")
@@ -625,13 +566,41 @@ async def backfill_historical(account_uid: str = None, offset_months: int = 0):
             "offset_months": offset_months,
             "transactions_fetched": len(all_transactions),
             "days_saved": saved,
-            "method": "balance_after_transaction" if has_balance_after else "reconstruction",
             "errors": errors[:5],
-            "raw_sample": raw_sample,
         }
 
     except Exception as e:
         return {"error": True, "step": "unhandled", "detail": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/api/db-stats")
+async def db_stats():
+    """Show how many balance records exist per month in daily_balances."""
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    TO_CHAR(DATE_TRUNC('month', recorded_date), 'YYYY-MM') AS month,
+                    COUNT(*) AS records,
+                    MIN(balance_amount) AS min_bal,
+                    MAX(balance_amount) AS max_bal
+                FROM daily_balances
+                GROUP BY DATE_TRUNC('month', recorded_date)
+                ORDER BY DATE_TRUNC('month', recorded_date) DESC
+            """)
+            rows = cur.fetchall()
+        conn.close()
+        return {
+            "total_months": len(rows),
+            "months": [
+                {"month": r[0], "records": r[1],
+                 "min": float(r[2]), "max": float(r[3])}
+                for r in rows
+            ]
+        }
+    except Exception as e:
+        return {"error": True, "detail": str(e)}
 
 
 @app.get("/api/debug-transactions")
