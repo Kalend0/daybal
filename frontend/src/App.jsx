@@ -311,8 +311,8 @@ function App() {
         }
         console.log('Bank connected, fetching balance...')
         setCallbackMessage('Bank connected! Loading balance...')
-        // Fetch balance data
-        await fetchBalanceData()
+        const prefs = await loadPreferences()
+        await fetchBalanceData(prefs.medianMonths, prefs.averageMonths)
         setAppState('dashboard')
       }
     } catch (err) {
@@ -342,7 +342,8 @@ function App() {
           if (statusData.account_uid) {
             localStorage.setItem('daybal_account_uid', statusData.account_uid)
           }
-          await fetchBalanceData()
+          const prefs = await loadPreferences()
+          await fetchBalanceData(prefs.medianMonths, prefs.averageMonths)
           setAppState('dashboard')
         } else {
           setAppState('connect')
@@ -393,13 +394,38 @@ function App() {
   const handleMedianChange = async (months) => {
     medianMonthsRef.current = months
     setMedianMonths(months)
+    savePreferences(months, averageMonthsRef.current)
     await fetchBalanceData(months, averageMonthsRef.current)
   }
 
   const handleAverageChange = async (months) => {
     averageMonthsRef.current = months
     setAverageMonths(months)
+    savePreferences(medianMonthsRef.current, months)
     await fetchBalanceData(medianMonthsRef.current, months)
+  }
+
+  const loadPreferences = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/preferences`)
+      const data = await res.json()
+      if (!data.error) {
+        setMedianMonths(data.median_months)
+        medianMonthsRef.current = data.median_months
+        setAverageMonths(data.average_months)
+        averageMonthsRef.current = data.average_months
+        return { medianMonths: data.median_months, averageMonths: data.average_months }
+      }
+    } catch (_) {}
+    return { medianMonths: medianMonthsRef.current, averageMonths: averageMonthsRef.current }
+  }
+
+  const savePreferences = (medMonths, avgMonths) => {
+    fetch(`${API_BASE}/preferences`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ median_months: medMonths, average_months: avgMonths })
+    }).catch(() => {})
   }
 
   const handleBankConnected = () => {

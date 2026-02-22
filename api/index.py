@@ -66,6 +66,14 @@ def init_db():
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_preferences (
+                    id INTEGER PRIMARY KEY,
+                    median_months INTEGER NOT NULL DEFAULT 12,
+                    average_months INTEGER NOT NULL DEFAULT 24,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
         conn.commit()
     finally:
         conn.close()
@@ -122,6 +130,41 @@ def upsert_daily_balance(date: str, amount: float, currency: str = "EUR"):
                         currency = EXCLUDED.currency
                 """,
                 (date, amount, currency)
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_user_preferences() -> dict:
+    """Return saved interval preferences, or defaults if not set."""
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT median_months, average_months FROM user_preferences WHERE id = 1")
+            row = cur.fetchone()
+            if row:
+                return {"median_months": row[0], "average_months": row[1]}
+        return {"median_months": 12, "average_months": 24}
+    finally:
+        conn.close()
+
+
+def save_user_preferences(median_months: int, average_months: int):
+    """Upsert the single-row preferences record."""
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO user_preferences (id, median_months, average_months, updated_at)
+                VALUES (1, %s, %s, NOW())
+                ON CONFLICT (id) DO UPDATE
+                    SET median_months = EXCLUDED.median_months,
+                        average_months = EXCLUDED.average_months,
+                        updated_at = NOW()
+                """,
+                (median_months, average_months)
             )
         conn.commit()
     finally:
@@ -447,6 +490,28 @@ async def get_comparison_data(
         "average_val": average_val,
         "historical_data_available": historical_data_available,
     }
+
+
+@app.get("/api/preferences")
+async def preferences_get():
+    """Return saved interval window preferences."""
+    try:
+        return get_user_preferences()
+    except Exception as e:
+        return {"median_months": 12, "average_months": 24, "error": str(e)}
+
+
+@app.post("/api/preferences")
+async def preferences_save(request: Request):
+    """Persist interval window preferences."""
+    body = await request.json()
+    median_months = int(body.get("median_months", 12))
+    average_months = int(body.get("average_months", 24))
+    try:
+        save_user_preferences(median_months, average_months)
+        return {"success": True}
+    except Exception as e:
+        return {"error": True, "detail": str(e)}
 
 
 @app.get("/api/backfill")
